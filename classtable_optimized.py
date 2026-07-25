@@ -4,7 +4,15 @@ from docx import Document
 from io import BytesIO
 import re
 import os
+import json
+import base64
 import unicodedata
+
+try:
+    import requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
 
 st.set_page_config(page_title="課表彙整系統", layout="wide")
 
@@ -24,6 +32,8 @@ DOWNLOAD_TEMPLATES = {
     "2. 課表範本": "課表.xlsx",
     "3. 教師排序表範本": "教師排序表.xlsx",
 }
+
+GITHUB_API_BASE = "https://api.github.com"
 
 # 支援多種常見的星期表示法（全形數字未涵蓋，如有需要可再擴充）
 DAY_MAP = {
@@ -365,9 +375,205 @@ def parse_schedule(df_time, assign_dict):
 
 
 # ============================================================
+# 雲端持久化：把整合後的資料存回 GitHub Repo，下次打開網頁自動還原
+# ============================================================
+def get_github_config():
+    """
+    從 st.secrets 讀取 GitHub 存檔設定。
+    需在 Streamlit Cloud 的 App settings → Secrets 加入類似：
+        [github]
+        token = "ghp_xxxxxxxxxxxxxxxxxxxx"
+        repo = "your-username/your-repo-name"
+        branch = "main"
+        data_path = "saved_data.json"
+    若未設定，回傳 None，代表雲端存檔功能停用（不影響其他功能正常使用）。
+    """
+    if not _REQUESTS_AVAILABLE:
+        return None
+    try:
+        gh = st.secrets["github"]
+        return {
+            "token": gh["token"],
+            "repo": gh["repo"],
+            "branch": gh.get("branch", "main"),
+            "path": gh.get("data_path", "saved_data.json"),
+        }
+    except Exception:
+        return None
+
+
+def serialize_period_dict(data: dict) -> dict:
+    """
+    class_data / teacher_data 的 key 是 (星期, 節次) tuple，JSON 不支援 tuple 當 key，
+    這裡轉成 "d_p" 字串格式方便存成 JSON，讀回時再還原成 tuple。
+    """
+    return {
+        name: {f"{d}_{p}": info for (d, p), info in periods.items()}
+        for name, periods in data.items()
+    }
+
+
+def deserialize_period_dict(data: dict) -> dict:
+    out = {}
+    for name, periods in data.items():
+        out[name] = {}
+        for key, info in periods.items():
+            d_str, p_str = key.split("_")
+            out[name][(int(d_str), int(p_str))] = info
+    return out
+
+
+def build_save_payload():
+    """把目前 session_state 中的整合結果打包成可存成 JSON 的字典。"""
+    return {
+        "class_data": serialize_period_dict(st.session_state.class_data),
+        "teacher_data": serialize_period_dict(st.session_state.teacher_data),
+        "tutors_map": st.session_state.tutors_map,
+        "base_hours": st.session_state.base_hours,
+        "total_counts": st.session_state.total_counts,
+        "ordered_teachers": st.session_state.ordered_teachers,
+        "df_assign": st.session_state.df_assign.to_dict(orient="records"),
+        "import_warnings": st.session_state.get("import_warnings", []),
+    }
+
+
+def restore_from_payload(payload: dict):
+    """把從雲端讀回的 JSON 資料還原成 session_state 需要的格式，並寫入 session_state。"""
+    class_data = deserialize_period_dict(payload["class_data"])
+    teacher_data = deserialize_period_dict(payload["teacher_data"])
+    df_assign = pd.DataFrame(payload["df_assign"])
+    ordered_teachers = payload.get("ordered_teachers", [])
+
+    st.session_state.update({
+        "class_data": class_data,
+        "teacher_data": teacher_data,
+        "tutors_map": payload.get("tutors_map", {}),
+        "base_hours": payload.get("base_hours", {}),
+        "total_counts": payload.get("total_counts", {}),
+        "ordered_teachers": ordered_teachers,
+        "df_assign": df_assign,
+        "import_warnings": payload.get("import_warnings", []),
+        "sel_class": sorted(class_data.keys())[0] if class_data else None,
+        "sel_teacher": ordered_teachers[0] if ordered_teachers else None,
+        "class_template": load_default_template(TEMPLATE_FILES["class"]),
+        "teacher_template": load_default_template(TEMPLATE_FILES["teacher"]),
+    })
+
+
+def github_save_data(payload: dict):
+    """將整合結果寫回 GitHub Repo（檔案不存在就新增，存在就更新）。"""
+    cfg = get_github_config()
+    if not cfg:
+        return False, "尚未設定 GitHub 存檔金鑰，已略過雲端儲存（僅存在目前這次連線的記憶體中）。"
+
+    api_url = f"{GITHUB_API_BASE}/repos/{cfg['repo']}/contents/{cfg['path']}"
+    headers = {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+
+    sha = None
+    try:
+        r = requests.get(api_url, headers=headers, params={"ref": cfg["branch"]}, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+    except requests.RequestException as e:
+        return False, f"連線 GitHub 失敗：{e}"
+
+    content_str = json.dumps(payload, ensure_ascii=False, indent=2)
+    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+    body = {"message": "📚 自動更新課表整合資料", "content": content_b64, "branch": cfg["branch"]}
+    if sha:
+        body["sha"] = sha
+
+    try:
+        r = requests.put(api_url, headers=headers, json=body, timeout=15)
+        if r.status_code in (200, 201):
+            return True, "已成功儲存至 GitHub，下次打開網頁會自動沿用這份資料。"
+        return False, f"雲端儲存失敗（HTTP {r.status_code}）：{r.text[:300]}"
+    except requests.RequestException as e:
+        return False, f"連線 GitHub 失敗：{e}"
+
+
+def github_load_data():
+    """從 GitHub Repo 讀取先前的存檔，回傳 (payload, error_message)。找不到檔案不算錯誤。"""
+    cfg = get_github_config()
+    if not cfg:
+        return None, None
+
+    api_url = f"{GITHUB_API_BASE}/repos/{cfg['repo']}/contents/{cfg['path']}"
+    headers = {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(api_url, headers=headers, params={"ref": cfg["branch"]}, timeout=15)
+        if r.status_code == 404:
+            return None, None
+        if r.status_code != 200:
+            return None, f"讀取雲端存檔失敗（HTTP {r.status_code}）：{r.text[:300]}"
+        content_str = base64.b64decode(r.json().get("content", "")).decode("utf-8")
+        return json.loads(content_str), None
+    except requests.RequestException as e:
+        return None, f"連線 GitHub 失敗：{e}"
+    except Exception as e:
+        return None, f"雲端存檔格式錯誤，可能已毀損：{e}"
+
+
+def github_delete_data():
+    """清空重置時一併刪除雲端存檔，避免下次打開網頁又被自動還原回來。"""
+    cfg = get_github_config()
+    if not cfg:
+        return
+    api_url = f"{GITHUB_API_BASE}/repos/{cfg['repo']}/contents/{cfg['path']}"
+    headers = {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(api_url, headers=headers, params={"ref": cfg["branch"]}, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+            requests.delete(
+                api_url, headers=headers,
+                json={"message": "🧹 清空課表整合資料", "sha": sha, "branch": cfg["branch"]},
+                timeout=15,
+            )
+    except requests.RequestException:
+        pass
+
+
+# ============================================================
+# 開啟網頁時，若尚未有資料且雲端有存檔，自動還原（不需重新上傳三份檔案）
+# ============================================================
+if "class_data" not in st.session_state and not st.session_state.get("_cloud_restore_attempted", False):
+    st.session_state["_cloud_restore_attempted"] = True  # 避免每次互動都重打 API
+    _payload, _err = github_load_data()
+    if _payload:
+        try:
+            restore_from_payload(_payload)
+            st.session_state["last_import_summary"] = "☁️ 已自動從雲端存檔載入上次整合完成的資料。"
+        except Exception as e:
+            st.session_state["_cloud_restore_error"] = f"雲端存檔還原失敗，請重新上傳三份檔案。技術訊息：{e}"
+    elif _err:
+        st.session_state["_cloud_restore_error"] = _err
+
+# ============================================================
 # 側邊欄：資料管理
 # ============================================================
 with st.sidebar:
+    cloud_cfg = get_github_config()
+    with st.expander("☁️ 雲端存檔狀態", expanded=False):
+        if cloud_cfg:
+            st.caption(f"已連接：{cloud_cfg['repo']}（{cloud_cfg['branch']} 分支）")
+            if st.session_state.get("_cloud_restore_error"):
+                st.warning(st.session_state["_cloud_restore_error"])
+            if "class_data" in st.session_state:
+                if st.button("🔄 手動重新同步到雲端"):
+                    ok, msg = github_save_data(build_save_payload())
+                    (st.success if ok else st.error)(msg)
+        elif not _REQUESTS_AVAILABLE:
+            st.caption(
+                "⚠️ 找不到 requests 套件，雲端存檔功能已停用。"
+                "請在 requirements.txt 加入一行「requests」後重新部署。"
+            )
+        else:
+            st.caption(
+                "尚未設定雲端存檔（st.secrets 缺少 [github] 設定），"
+                "目前僅會暫存在本次連線中，重新整理網頁後仍需重新上傳。"
+            )
+
     st.header("⚙️ 資料管理")
 
     if "confirm_reset" not in st.session_state:
@@ -381,6 +587,7 @@ with st.sidebar:
         st.warning("確定要清空所有已匯入的資料嗎？此動作無法復原。")
         cc1, cc2 = st.columns(2)
         if cc1.button("✅ 確定清空"):
+            github_delete_data()
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -444,9 +651,12 @@ with st.sidebar:
                     "sel_class": sorted(class_data.keys())[0],
                     "sel_teacher": ordered_teachers[0],
                 })
+                ok, cloud_msg = github_save_data(build_save_payload())
+                cloud_suffix = f"\n\n☁️ {cloud_msg}"
                 st.session_state["last_import_summary"] = (
                     f"✅ 整合完成！共解析 {len(class_data)} 個班級、"
                     f"{len(ordered_teachers)} 位教師、{len(assign_lookup)} 筆配課紀錄。"
+                    f"{cloud_suffix}"
                 )
                 st.rerun()
             except DataValidationError as e:
