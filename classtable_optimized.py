@@ -327,9 +327,25 @@ def parse_teacher_sort(df_sort, all_teachers_list):
     return ordered_teachers, base_hours, warnings
 
 
+def _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c_raw, s_raw, d, p, assign_dict):
+    """登記單一節課的資料，供一維／矩陣兩種課表格式共用，避免重複邏輯。"""
+    if not s_raw or s_raw == "nan":
+        display_t, s_raw, curr_t_list = "", "", []
+    else:
+        curr_t_list = assign_dict.get((c_raw, s_raw), [])
+        display_t = "/".join(curr_t_list) if curr_t_list else "未知教師"
+        if not curr_t_list:
+            warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
+
+    class_data.setdefault(c_raw, {})[(d, p)] = {"subj": s_raw, "teacher": display_t}
+    for t in curr_t_list:
+        teacher_data.setdefault(t, {})[(d, p)] = {"subj": s_raw, "class": c_raw}
+        total_counts[t] = total_counts.get(t, 0) + 1
+
+
 def parse_schedule(df_time, assign_dict):
     """
-    解析課表，並與配課表（assign_dict）比對出每一節課的授課教師。
+    解析【一維清單格式】課表（需有「班級」「科目」「星期」「節次」欄位，每列代表一節課）。
     使用字典查詢取代舊版逐筆掃描 assign_lookup 的線性比對，是效能優化的重點之一。
     """
     warnings = []
@@ -352,18 +368,7 @@ def parse_schedule(df_time, assign_dict):
         if p not in PERIODS:
             continue
 
-        if not s_raw or s_raw == "nan":
-            display_t, s_raw, curr_t_list = "", "", []
-        else:
-            curr_t_list = assign_dict.get((c_raw, s_raw), [])
-            display_t = "/".join(curr_t_list) if curr_t_list else "未知教師"
-            if not curr_t_list:
-                warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
-
-        class_data.setdefault(c_raw, {})[(d, p)] = {"subj": s_raw, "teacher": display_t}
-        for t in curr_t_list:
-            teacher_data.setdefault(t, {})[(d, p)] = {"subj": s_raw, "class": c_raw}
-            total_counts[t] = total_counts.get(t, 0) + 1
+        _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c_raw, s_raw, d, p, assign_dict)
 
     if unmatched_format:
         warnings.append(f"共有 {unmatched_format} 筆課表資料的「星期」或「節次」格式無法辨識，已自動略過。")
@@ -372,6 +377,69 @@ def parse_schedule(df_time, assign_dict):
         raise DataValidationError("課表中沒有解析出任何有效的班級課程資料，請確認欄位內容與格式是否正確。")
 
     return class_data, teacher_data, total_counts, warnings
+
+
+# 矩陣型課表的列標籤格式，例如「一-1」「週二-3」，允許常見的破折號變體
+_SCHEDULE_ROW_LABEL_PATTERN = re.compile(r"^(.+?)[-_－﹣]\s*(\d+)$")
+
+
+def parse_schedule_matrix(df_matrix, assign_dict):
+    """
+    解析【矩陣格式】課表：
+      - 第一欄（表頭通常留白）為「星期-節次」，例如「一-1」「二-3」
+      - 其餘欄位表頭為班級名稱（例如 701、702…）
+      - 儲存格內容為該節次的科目名稱，空白代表沒有排課
+    會自動把矩陣攤平成與一維格式相同的 class_data / teacher_data 結構。
+    """
+    warnings = []
+    if df_matrix.shape[1] < 2:
+        raise DataValidationError("「課表」欄位數量不足，無法辨識矩陣格式（需至少一欄星期節次＋一欄以上的班級）。")
+
+    row_label_col = df_matrix.columns[0]
+    class_cols = list(df_matrix.columns[1:])
+
+    class_data, teacher_data, total_counts = {}, {}, {}
+    unmatched_format = 0
+
+    for _, row in df_matrix.iterrows():
+        label = str(row[row_label_col]).strip()
+        m = _SCHEDULE_ROW_LABEL_PATTERN.match(label)
+        if not m:
+            unmatched_format += 1
+            continue
+
+        day_key = m.group(1).strip().lower()
+        d = DAY_MAP.get(day_key, 0)
+        p = int(m.group(2))
+        if d == 0 or p not in PERIODS:
+            unmatched_format += 1
+            continue
+
+        for c_col in class_cols:
+            c_raw = str(c_col).strip()
+            s_val = row[c_col]
+            s_raw = "" if pd.isna(s_val) else str(s_val).strip()
+            _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c_raw, s_raw, d, p, assign_dict)
+
+    if unmatched_format:
+        warnings.append(f"共有 {unmatched_format} 列「星期-節次」格式無法辨識（例如應為「一-1」），已自動略過。")
+
+    if not class_data:
+        raise DataValidationError("課表（矩陣格式）中沒有解析出任何有效的班級課程資料，請確認格式是否正確。")
+
+    return class_data, teacher_data, total_counts, warnings
+
+
+def parse_schedule_auto(df_time, assign_dict):
+    """
+    自動辨識課表檔案是哪一種格式並解析：
+      - 一維清單格式：欄位包含「班級」「科目」「星期」「節次」
+      - 矩陣格式：第一欄為星期-節次（如「一-1」），其餘欄位表頭為班級名稱
+    """
+    long_format_cols = {"班級", "科目", "星期", "節次"}
+    if long_format_cols.issubset(set(df_time.columns)):
+        return parse_schedule(df_time, assign_dict)
+    return parse_schedule_matrix(df_time, assign_dict)
 
 
 # ============================================================
@@ -612,7 +680,10 @@ with st.sidebar:
 
     st.subheader("📤 上傳資料檔")
     f_assign = st.file_uploader("1. 上傳【配課表】", type=["xlsx", "csv"])
-    f_time = st.file_uploader("2. 上傳【課表】", type=["xlsx", "csv"])
+    f_time = st.file_uploader(
+        "2. 上傳【課表】", type=["xlsx", "csv"],
+        help="支援兩種格式：一維清單（欄位：班級／科目／星期／節次）或矩陣格式（第一欄為「一-1」這種星期-節次，其餘欄位為班級），系統會自動判斷。",
+    )
     f_sort = st.file_uploader("3. 上傳【教師排序暨時數表】(選填)", type=["xlsx", "csv"])
 
     if f_assign and f_time and st.button("🚀 執行整合"):
@@ -634,7 +705,7 @@ with st.sidebar:
                     assign_lookup, assign_dict, tutors, all_teachers_db, w1 = parse_assignment(df_assign)
                     all_teachers_list = list(all_teachers_db)
                     ordered_teachers, base_hours, w2 = parse_teacher_sort(df_sort, all_teachers_list)
-                    class_data, teacher_data, total_counts, w3 = parse_schedule(df_time, assign_dict)
+                    class_data, teacher_data, total_counts, w3 = parse_schedule_auto(df_time, assign_dict)
                     all_warnings = w1 + w2 + w3
 
                 st.session_state.update({
