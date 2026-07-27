@@ -246,9 +246,11 @@ def parse_assignment(df_assign):
         for t in valid:
             assign_lookup.append({"c": c, "s": s, "t": t})
             all_teachers_db.add(t)
-        if valid:
-            assign_dict.setdefault((c, s), [])
-            assign_dict[(c, s)].extend(valid)
+        # 無論教師欄位是否填寫，都建立這組 (班級,科目) 的鍵值。
+        # 這樣課表比對時才能區分「配課表已登記但教師欄位留空」（顯示空白即可）
+        # 與「配課表中根本沒有這個班級/科目組合」（顯示未知教師並提出警告）兩種情況。
+        assign_dict.setdefault((c, s), [])
+        assign_dict[(c, s)].extend(valid)
         return valid
 
     if "科目" in df_assign.columns and "教師" in df_assign.columns:
@@ -279,8 +281,6 @@ def parse_assignment(df_assign):
             c = str(row["班級"]).strip()
             s = str(row["科目"]).strip()
             t_raw = str(row["教師"]).strip() if pd.notna(row["教師"]) else ""
-            if not t_raw or t_raw == "nan":
-                continue
             register(c, s, t_raw)
 
     if not assign_lookup:
@@ -331,11 +331,16 @@ def _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c
     """登記單一節課的資料，供一維／矩陣兩種課表格式共用，避免重複邏輯。"""
     if not s_raw or s_raw == "nan":
         display_t, s_raw, curr_t_list = "", "", []
+    elif (c_raw, s_raw) in assign_dict:
+        # 配課表中有登記這個班級/科目組合。若教師欄位當初留空，這裡就是空清單，
+        # 顯示空白即可（例如社團活動、班會等不一定要填教師的科目），不需要警告。
+        curr_t_list = assign_dict[(c_raw, s_raw)]
+        display_t = "/".join(curr_t_list)
     else:
-        curr_t_list = assign_dict.get((c_raw, s_raw), [])
-        display_t = "/".join(curr_t_list) if curr_t_list else "未知教師"
-        if not curr_t_list:
-            warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
+        # 配課表中完全查無這個班級/科目組合，較可能是資料填寫錯誤或科目名稱打錯字，才需要提醒。
+        curr_t_list = []
+        display_t = "未知教師"
+        warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
 
     class_data.setdefault(c_raw, {})[(d, p)] = {"subj": s_raw, "teacher": display_t}
     for t in curr_t_list:
@@ -528,6 +533,26 @@ def restore_from_payload(payload: dict):
     })
 
 
+def _format_github_http_error(status_code, text, action="操作"):
+    """把 GitHub API 常見錯誤碼轉成使用者看得懂、附排查建議的訊息。"""
+    if status_code == 403 and "not accessible" in text.lower():
+        return (
+            f"雲端{action}失敗（HTTP 403：Token 沒有寫入/讀取權限）。請依序檢查：\n"
+            "1. Token 的「Repository access」是否確實包含這個 repo\n"
+            "2. Token 的「Permissions → Contents」是否設為「Read and write」\n"
+            "3. 若 repo 屬於 Organization（組織），Fine-grained token 需要組織管理員核准，"
+            "請確認 token 狀態不是「Pending approval」\n"
+            "4. secrets 裡的 repo 欄位格式是否為「帳號名稱/repo名稱」，拼字與大小寫是否正確\n"
+            "（若一直卡關，改用 Classic Token 並勾選「repo」scope 通常最不容易出錯）\n"
+            f"原始錯誤：{text[:200]}"
+        )
+    if status_code == 401:
+        return f"雲端{action}失敗（HTTP 401：Token 無效或已過期），請重新產生一組 Token 並更新 secrets。"
+    if status_code == 404:
+        return f"雲端{action}失敗（HTTP 404：找不到 repo 或分支），請確認 secrets 裡的 repo／branch 名稱是否正確。"
+    return f"雲端{action}失敗（HTTP {status_code}）：{text[:300]}"
+
+
 def github_save_data(payload: dict):
     """將整合結果寫回 GitHub Repo（檔案不存在就新增，存在就更新）。"""
     cfg = get_github_config()
@@ -555,7 +580,7 @@ def github_save_data(payload: dict):
         r = requests.put(api_url, headers=headers, json=body, timeout=15)
         if r.status_code in (200, 201):
             return True, "已成功儲存至 GitHub，下次打開網頁會自動沿用這份資料。"
-        return False, f"雲端儲存失敗（HTTP {r.status_code}）：{r.text[:300]}"
+        return False, _format_github_http_error(r.status_code, r.text, action="儲存")
     except requests.RequestException as e:
         return False, f"連線 GitHub 失敗：{e}"
 
@@ -573,7 +598,7 @@ def github_load_data():
         if r.status_code == 404:
             return None, None
         if r.status_code != 200:
-            return None, f"讀取雲端存檔失敗（HTTP {r.status_code}）：{r.text[:300]}"
+            return None, _format_github_http_error(r.status_code, r.text, action="讀取")
         content_str = base64.b64decode(r.json().get("content", "")).decode("utf-8")
         return json.loads(content_str), None
     except requests.RequestException as e:
@@ -778,7 +803,11 @@ if "class_data" in st.session_state:
             row = {"節次": f"第 {p} 節"}
             for d in DAYS:
                 info = st.session_state.class_data[target_c].get((d, p))
-                row[f"週{d}"] = f"{info['subj']}\n({info['teacher']})" if info else ""
+                if info:
+                    teacher_part = f"\n({info['teacher']})" if info["teacher"] else ""
+                    row[f"週{d}"] = f"{info['subj']}{teacher_part}"
+                else:
+                    row[f"週{d}"] = ""
             c_preview.append(row)
         st.table(pd.DataFrame(c_preview))
 
