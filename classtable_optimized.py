@@ -28,9 +28,9 @@ TEMPLATE_FILES = {
 }
 
 DOWNLOAD_TEMPLATES = {
-    "1. 配課表範本": "配課表.xlsx",
-    "2. 課表範本": "課表.xlsx",
-    "3. 教師排序表範本": "教師排序表.xlsx",
+    "1. 115配課表": "115配課表.xlsx",
+    "2. 115課表": "115課表.xlsx",
+    "3. 115教師表": "115教師表.xlsx",
 }
 
 GITHUB_API_BASE = "https://api.github.com"
