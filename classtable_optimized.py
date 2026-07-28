@@ -664,7 +664,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.subheader("📥 範本下載")
+    st.subheader("📥 115下載")
     for label, file_name in DOWNLOAD_TEMPLATES.items():
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
