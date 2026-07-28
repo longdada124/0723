@@ -14,7 +14,7 @@ try:
 except ImportError:
     _REQUESTS_AVAILABLE = False
 
-st.set_page_config(page_title="課表彙整系統", layout="wide")
+st.set_page_config(page_title="課表彙整", layout="wide")
 
 # ============================================================
 # 常數設定
