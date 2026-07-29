@@ -14,7 +14,7 @@ try:
 except ImportError:
     _REQUESTS_AVAILABLE = False
 
-st.set_page_config(page_title="課表彙整", layout="wide")
+st.set_page_config(page_title="課表彙整系統", layout="wide")
 
 # ============================================================
 # 常數設定
@@ -28,9 +28,9 @@ TEMPLATE_FILES = {
 }
 
 DOWNLOAD_TEMPLATES = {
-    "1. 115配課表": "115配課表.xlsx",
-    "2. 115課表": "115課表.xlsx",
-    "3. 115教師表": "115教師表.xlsx",
+    "1. 配課表範本": "配課表.xlsx",
+    "2. 課表範本": "課表.xlsx",
+    "3. 教師排序表範本": "教師排序表.xlsx",
 }
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -246,9 +246,11 @@ def parse_assignment(df_assign):
         for t in valid:
             assign_lookup.append({"c": c, "s": s, "t": t})
             all_teachers_db.add(t)
-        if valid:
-            assign_dict.setdefault((c, s), [])
-            assign_dict[(c, s)].extend(valid)
+        # 無論教師欄位是否填寫，都建立這組 (班級,科目) 的鍵值。
+        # 這樣課表比對時才能區分「配課表已登記但教師欄位留空」（顯示空白即可）
+        # 與「配課表中根本沒有這個班級/科目組合」（顯示未知教師並提出警告）兩種情況。
+        assign_dict.setdefault((c, s), [])
+        assign_dict[(c, s)].extend(valid)
         return valid
 
     if "科目" in df_assign.columns and "教師" in df_assign.columns:
@@ -279,8 +281,6 @@ def parse_assignment(df_assign):
             c = str(row["班級"]).strip()
             s = str(row["科目"]).strip()
             t_raw = str(row["教師"]).strip() if pd.notna(row["教師"]) else ""
-            if not t_raw or t_raw == "nan":
-                continue
             register(c, s, t_raw)
 
     if not assign_lookup:
@@ -331,11 +331,16 @@ def _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c
     """登記單一節課的資料，供一維／矩陣兩種課表格式共用，避免重複邏輯。"""
     if not s_raw or s_raw == "nan":
         display_t, s_raw, curr_t_list = "", "", []
+    elif (c_raw, s_raw) in assign_dict:
+        # 配課表中有登記這個班級/科目組合。若教師欄位當初留空，這裡就是空清單，
+        # 顯示空白即可（例如社團活動、班會等不一定要填教師的科目），不需要警告。
+        curr_t_list = assign_dict[(c_raw, s_raw)]
+        display_t = "/".join(curr_t_list)
     else:
-        curr_t_list = assign_dict.get((c_raw, s_raw), [])
-        display_t = "/".join(curr_t_list) if curr_t_list else "未知教師"
-        if not curr_t_list:
-            warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
+        # 配課表中完全查無這個班級/科目組合，較可能是資料填寫錯誤或科目名稱打錯字，才需要提醒。
+        curr_t_list = []
+        display_t = "未知教師"
+        warnings.append(f"{c_raw} 週{d}第{p}節「{s_raw}」在配課表中查無對應教師。")
 
     class_data.setdefault(c_raw, {})[(d, p)] = {"subj": s_raw, "teacher": display_t}
     for t in curr_t_list:
@@ -442,6 +447,29 @@ def parse_schedule_auto(df_time, assign_dict):
     return parse_schedule_matrix(df_time, assign_dict)
 
 
+def collect_class_subject_combos(class_data):
+    """取得目前課表中出現過的所有 (班級,科目) 組合（不含空堂）。"""
+    combos = set()
+    for c, periods in class_data.items():
+        for info in periods.values():
+            subj = info.get("subj", "")
+            if subj:
+                combos.add((c, subj))
+    return combos
+
+
+def compute_actual_subject_counts(class_data):
+    """統計目前課表中，每個 (班級,科目) 實際被排了幾節課（不含空堂）。"""
+    counts = {}
+    for c, periods in class_data.items():
+        for info in periods.values():
+            subj = info.get("subj", "")
+            if subj:
+                key = (c, subj)
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 # ============================================================
 # 雲端持久化：把整合後的資料存回 GitHub Repo，下次打開網頁自動還原
 # ============================================================
@@ -502,6 +530,7 @@ def build_save_payload():
         "ordered_teachers": st.session_state.ordered_teachers,
         "df_assign": st.session_state.df_assign.to_dict(orient="records"),
         "import_warnings": st.session_state.get("import_warnings", []),
+        "expected_hours": st.session_state.get("expected_hours", {}),
     }
 
 
@@ -521,11 +550,32 @@ def restore_from_payload(payload: dict):
         "ordered_teachers": ordered_teachers,
         "df_assign": df_assign,
         "import_warnings": payload.get("import_warnings", []),
+        "expected_hours": payload.get("expected_hours", {}),
         "sel_class": sorted(class_data.keys())[0] if class_data else None,
         "sel_teacher": ordered_teachers[0] if ordered_teachers else None,
         "class_template": load_default_template(TEMPLATE_FILES["class"]),
         "teacher_template": load_default_template(TEMPLATE_FILES["teacher"]),
     })
+
+
+def _format_github_http_error(status_code, text, action="操作"):
+    """把 GitHub API 常見錯誤碼轉成使用者看得懂、附排查建議的訊息。"""
+    if status_code == 403 and "not accessible" in text.lower():
+        return (
+            f"雲端{action}失敗（HTTP 403：Token 沒有寫入/讀取權限）。請依序檢查：\n"
+            "1. Token 的「Repository access」是否確實包含這個 repo\n"
+            "2. Token 的「Permissions → Contents」是否設為「Read and write」\n"
+            "3. 若 repo 屬於 Organization（組織），Fine-grained token 需要組織管理員核准，"
+            "請確認 token 狀態不是「Pending approval」\n"
+            "4. secrets 裡的 repo 欄位格式是否為「帳號名稱/repo名稱」，拼字與大小寫是否正確\n"
+            "（若一直卡關，改用 Classic Token 並勾選「repo」scope 通常最不容易出錯）\n"
+            f"原始錯誤：{text[:200]}"
+        )
+    if status_code == 401:
+        return f"雲端{action}失敗（HTTP 401：Token 無效或已過期），請重新產生一組 Token 並更新 secrets。"
+    if status_code == 404:
+        return f"雲端{action}失敗（HTTP 404：找不到 repo 或分支），請確認 secrets 裡的 repo／branch 名稱是否正確。"
+    return f"雲端{action}失敗（HTTP {status_code}）：{text[:300]}"
 
 
 def github_save_data(payload: dict):
@@ -555,7 +605,7 @@ def github_save_data(payload: dict):
         r = requests.put(api_url, headers=headers, json=body, timeout=15)
         if r.status_code in (200, 201):
             return True, "已成功儲存至 GitHub，下次打開網頁會自動沿用這份資料。"
-        return False, f"雲端儲存失敗（HTTP {r.status_code}）：{r.text[:300]}"
+        return False, _format_github_http_error(r.status_code, r.text, action="儲存")
     except requests.RequestException as e:
         return False, f"連線 GitHub 失敗：{e}"
 
@@ -573,7 +623,7 @@ def github_load_data():
         if r.status_code == 404:
             return None, None
         if r.status_code != 200:
-            return None, f"讀取雲端存檔失敗（HTTP {r.status_code}）：{r.text[:300]}"
+            return None, _format_github_http_error(r.status_code, r.text, action="讀取")
         content_str = base64.b64decode(r.json().get("content", "")).decode("utf-8")
         return json.loads(content_str), None
     except requests.RequestException as e:
@@ -664,7 +714,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.subheader("📥 115下載")
+    st.subheader("📥 範本下載")
     for label, file_name in DOWNLOAD_TEMPLATES.items():
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -753,8 +803,8 @@ if "class_data" in st.session_state:
             if len(import_warnings) > 50:
                 st.caption(f"…等共 {len(import_warnings)} 筆，僅顯示前 50 筆。")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🏫 班級課表", "👩‍🏫 教師課表", "📋 配課總覽與分頁匯出", "🔍 課表搜尋"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["🏫 班級課表", "👩‍🏫 教師課表", "📋 配課總覽與分頁匯出", "🔍 課表搜尋", "📊 節數檢查"]
     )
 
     with tab1:
@@ -778,7 +828,11 @@ if "class_data" in st.session_state:
             row = {"節次": f"第 {p} 節"}
             for d in DAYS:
                 info = st.session_state.class_data[target_c].get((d, p))
-                row[f"週{d}"] = f"{info['subj']}\n({info['teacher']})" if info else ""
+                if info:
+                    teacher_part = f"\n({info['teacher']})" if info["teacher"] else ""
+                    row[f"週{d}"] = f"{info['subj']}{teacher_part}"
+                else:
+                    row[f"週{d}"] = ""
             c_preview.append(row)
         st.table(pd.DataFrame(c_preview))
 
@@ -921,6 +975,85 @@ if "class_data" in st.session_state:
                 st.warning(f"找不到符合「{keyword}」的紀錄，請確認關鍵字是否正確。")
         else:
             st.info("請輸入關鍵字開始搜尋。")
+
+    with tab5:
+        st.header("📊 節數檢查")
+        st.caption("設定每個班級、每個科目「一週應該排幾節課」，系統會自動跟目前匯入的課表比對，抓出排多或排少的地方。")
+
+        combos = sorted(collect_class_subject_combos(st.session_state.class_data))
+        if "expected_hours" not in st.session_state:
+            st.session_state.expected_hours = {}
+
+        if not combos:
+            st.info("目前課表中沒有解析出任何科目，無法進行節數檢查。")
+        else:
+            st.subheader("① 設定應排節數")
+            setting_rows = [
+                {"班級": c, "科目": s, "應排節數": int(st.session_state.expected_hours.get(f"{c}|{s}", 0))}
+                for c, s in combos
+            ]
+            setting_df = pd.DataFrame(setting_rows)
+
+            edited_df = st.data_editor(
+                setting_df,
+                use_container_width=True,
+                hide_index=True,
+                key="expected_hours_editor",
+                disabled=["班級", "科目"],
+                column_config={
+                    "應排節數": st.column_config.NumberColumn(
+                        min_value=0, step=1, help="這個班級這個科目，一週應該排幾節課"
+                    ),
+                },
+            )
+
+            # 把編輯結果同步回 session_state，供雲端存檔與下方比對使用
+            new_expected = {}
+            for _, row in edited_df.iterrows():
+                key = f"{row['班級']}|{row['科目']}"
+                try:
+                    new_expected[key] = int(row["應排節數"])
+                except (ValueError, TypeError):
+                    new_expected[key] = 0
+            st.session_state.expected_hours = new_expected
+
+            if st.button("💾 儲存節數設定"):
+                ok, msg = github_save_data(build_save_payload())
+                st.success(f"☁️ {msg}") if ok else st.warning(msg)
+
+            st.divider()
+            st.subheader("② 比對結果")
+
+            actual_counts = compute_actual_subject_counts(st.session_state.class_data)
+            check_rows = []
+            for c, s in combos:
+                expected = st.session_state.expected_hours.get(f"{c}|{s}", 0)
+                actual = actual_counts.get((c, s), 0)
+                diff = actual - expected
+                if diff == 0:
+                    status = "✅ 相符"
+                elif diff > 0:
+                    status = f"⚠️ 多排 {diff} 節"
+                else:
+                    status = f"❌ 少排 {abs(diff)} 節"
+                check_rows.append({
+                    "班級": c, "科目": s, "應排節數": expected, "實際節數": actual, "差異": diff, "狀態": status,
+                })
+            check_df = pd.DataFrame(check_rows)
+
+            only_mismatch = st.checkbox("只顯示節數不相符的項目", value=True)
+            display_df = check_df[check_df["差異"] != 0] if only_mismatch else check_df
+
+            mismatch_count = int((check_df["差異"] != 0).sum())
+            if mismatch_count == 0:
+                st.success("🎉 所有已設定應排節數的科目，實際排課節數都相符！")
+            else:
+                st.warning(f"⚠️ 共有 {mismatch_count} 項班級科目的節數跟設定不相符")
+
+            st.dataframe(
+                display_df.sort_values(["班級", "科目"]).reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
 
 else:
     st.info("👋 請上傳資料檔並點擊執行整合。")
