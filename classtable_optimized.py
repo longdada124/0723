@@ -22,6 +22,10 @@ st.set_page_config(page_title="課表彙整系統", layout="wide")
 DAYS = range(1, 6)      # 週一 ~ 週五
 PERIODS = range(1, 9)   # 第1節 ~ 第8節
 
+# 計算教師「教學總時數」統計時要排除的節次（例如第8節通常是課後輔導/社團，不計入正式教學時數）。
+# 課表本身仍會照常顯示這些節次的排課內容，只有統計數字（BASE/TOTAL/EXTRA）不列入計算。
+HOURS_EXCLUDED_PERIODS = {8}
+
 TEMPLATE_FILES = {
     "class": "班級樣板.docx",
     "teacher": "教師樣板.docx",
@@ -359,7 +363,8 @@ def _register_schedule_entry(class_data, teacher_data, total_counts, warnings, c
     class_data.setdefault(c_raw, {})[(d, p)] = {"subj": s_raw, "teacher": display_t}
     for t in curr_t_list:
         teacher_data.setdefault(t, {})[(d, p)] = {"subj": s_raw, "class": c_raw}
-        total_counts[t] = total_counts.get(t, 0) + 1
+        if p not in HOURS_EXCLUDED_PERIODS:
+            total_counts[t] = total_counts.get(t, 0) + 1
 
 
 def parse_schedule(df_time, assign_dict):
@@ -553,7 +558,8 @@ def rebuild_teacher_data(class_data):
                 if not t or t == "未知教師":
                     continue
                 teacher_data.setdefault(t, {})[(d, p)] = {"subj": info.get("subj", ""), "class": c}
-                total_counts[t] = total_counts.get(t, 0) + 1
+                if p not in HOURS_EXCLUDED_PERIODS:
+                    total_counts[t] = total_counts.get(t, 0) + 1
     return teacher_data, total_counts
 
 
