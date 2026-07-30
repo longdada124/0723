@@ -447,14 +447,24 @@ def parse_schedule_auto(df_time, assign_dict):
     return parse_schedule_matrix(df_time, assign_dict)
 
 
-def collect_class_subject_combos(class_data):
-    """取得目前課表中出現過的所有 (班級,科目) 組合（不含空堂）。"""
+def collect_class_subject_combos(class_data, assign_dict=None):
+    """
+    取得節數檢查需要比對的所有 (班級,科目) 組合，取兩個來源的聯集：
+      1. 實際課表中出現過的科目（不含空堂）
+      2. 配課表中登記過的科目（不含用來標記導師的特殊列「班級」）
+    如果只看第 1 項，會漏掉「配課表配了老師、但整學期完全沒被排進課表」的科目，
+    第 2 項就是專門補上這個漏洞。
+    """
     combos = set()
     for c, periods in class_data.items():
         for info in periods.values():
             subj = info.get("subj", "")
             if subj:
                 combos.add((c, subj))
+    if assign_dict:
+        for (c, s) in assign_dict.keys():
+            if s and s != "班級":
+                combos.add((c, s))
     return combos
 
 
@@ -468,6 +478,69 @@ def compute_actual_subject_counts(class_data):
                 key = (c, subj)
                 counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def detect_teacher_conflicts(class_data):
+    """
+    偵測「同一位教師在同一時段被排到多個不同班級」的排課衝突。
+    以 class_data（各班課表）為基礎逐一攤開比對，一節課若由多位教師合開
+    （以「/」分隔），會分別檢查每一位教師。
+    回傳 list，每筆為 {'teacher','day','period','classes'}，並依 週幾/第幾節 排序。
+    """
+    slot_map = {}
+    for c, periods in class_data.items():
+        for (d, p), info in periods.items():
+            teacher_str = info.get("teacher", "")
+            if not teacher_str:
+                continue
+            for t in teacher_str.split("/"):
+                t = t.strip()
+                if not t or t == "未知教師":
+                    continue
+                slot_map.setdefault((t, d, p), set()).add(c)
+
+    conflicts = [
+        {"teacher": t, "day": d, "period": p, "classes": sorted(classes)}
+        for (t, d, p), classes in slot_map.items()
+        if len(classes) > 1
+    ]
+    conflicts.sort(key=lambda x: (x["day"], x["period"], x["teacher"]))
+    return conflicts
+
+
+def resolve_teacher_display(c_raw, s_raw, assign_dict):
+    """
+    依照配課表判斷某節課應顯示的教師文字，邏輯與匯入課表時的 _register_schedule_entry 一致，
+    供「網頁上直接編輯課表」功能使用，確保手動編輯跟匯入的結果呈現一致。
+    """
+    s_raw = (s_raw or "").strip()
+    if not s_raw or s_raw == "nan":
+        return "", ""
+    if (c_raw, s_raw) in assign_dict:
+        curr_t_list = assign_dict[(c_raw, s_raw)]
+        return s_raw, ("/".join(curr_t_list) if curr_t_list else "")
+    return s_raw, "未知教師"
+
+
+def rebuild_teacher_data(class_data):
+    """
+    根據目前的 class_data（各班課表，唯一的真實來源）重新計算 teacher_data 與 total_counts。
+    用於使用者在網頁上手動編輯某個班級的課表之後，確保教師課表與統計數字保持同步，
+    避免手動增修造成資料不一致。
+    """
+    teacher_data, total_counts = {}, {}
+    for c, periods in class_data.items():
+        for (d, p), info in periods.items():
+            teacher_str = info.get("teacher", "")
+            if not teacher_str:
+                continue
+            for t in teacher_str.split("/"):
+                t = t.strip()
+                if not t or t == "未知教師":
+                    continue
+                teacher_data.setdefault(t, {})[(d, p)] = {"subj": info.get("subj", ""), "class": c}
+                total_counts[t] = total_counts.get(t, 0) + 1
+    return teacher_data, total_counts
 
 
 # ============================================================
@@ -756,7 +829,15 @@ with st.sidebar:
                     all_teachers_list = list(all_teachers_db)
                     ordered_teachers, base_hours, w2 = parse_teacher_sort(df_sort, all_teachers_list)
                     class_data, teacher_data, total_counts, w3 = parse_schedule_auto(df_time, assign_dict)
-                    all_warnings = w1 + w2 + w3
+
+                    conflicts = detect_teacher_conflicts(class_data)
+                    w4 = [
+                        f"🚨 排課衝突：{cf['teacher']} 老師在 週{cf['day']} 第{cf['period']}節 "
+                        f"同時被排到 {'、'.join(cf['classes'])}，請確認是否為人工排課錯誤。"
+                        for cf in conflicts
+                    ]
+
+                    all_warnings = w1 + w2 + w3 + w4
 
                 st.session_state.update({
                     "class_template": class_temp,
@@ -774,10 +855,11 @@ with st.sidebar:
                 })
                 ok, cloud_msg = github_save_data(build_save_payload())
                 cloud_suffix = f"\n\n☁️ {cloud_msg}"
+                conflict_suffix = f"\n\n🚨 偵測到 {len(conflicts)} 筆排課衝突，請至下方「⚠️ 匯入警告」查看詳情。" if conflicts else ""
                 st.session_state["last_import_summary"] = (
                     f"✅ 整合完成！共解析 {len(class_data)} 個班級、"
                     f"{len(ordered_teachers)} 位教師、{len(assign_lookup)} 筆配課紀錄。"
-                    f"{cloud_suffix}"
+                    f"{conflict_suffix}{cloud_suffix}"
                 )
                 st.rerun()
             except DataValidationError as e:
@@ -857,6 +939,49 @@ if "class_data" in st.session_state:
                                 main_doc.element.body.append(el)
                 if main_doc:
                     st.download_button("💾 下載班級彙整檔", doc_to_bytes(main_doc), "全校班級課表.docx")
+
+        with st.expander(f"✏️ 修正 {target_c} 的排課錯誤", expanded=False):
+            st.caption("直接修改下方表格的科目名稱即可（教師會依照配課表自動帶入，不需手動輸入），改完按下方按鈕儲存。留空代表該節沒有排課。")
+
+            edit_rows = []
+            for p in PERIODS:
+                row = {"節次": f"第 {p} 節"}
+                for d in DAYS:
+                    info = st.session_state.class_data[target_c].get((d, p), {})
+                    row[f"週{d}"] = info.get("subj", "")
+                edit_rows.append(row)
+            schedule_edit_df = pd.DataFrame(edit_rows)
+
+            edited_schedule_df = st.data_editor(
+                schedule_edit_df,
+                use_container_width=True,
+                hide_index=True,
+                key=f"schedule_editor_{target_c}",
+                disabled=["節次"],
+            )
+
+            if st.button(f"💾 儲存 {target_c} 的修改", key=f"save_schedule_{target_c}"):
+                _al, assign_dict_for_edit, _tu, _at, _w = parse_assignment(st.session_state.df_assign)
+
+                new_periods = {}
+                for idx, p in enumerate(PERIODS):
+                    for d in DAYS:
+                        raw_val = edited_schedule_df.iloc[idx][f"週{d}"]
+                        raw_subj = "" if pd.isna(raw_val) else str(raw_val).strip()
+                        s_clean, display_t = resolve_teacher_display(target_c, raw_subj, assign_dict_for_edit)
+                        new_periods[(d, p)] = {"subj": s_clean, "teacher": display_t}
+
+                st.session_state.class_data[target_c] = new_periods
+                new_teacher_data, new_total_counts = rebuild_teacher_data(st.session_state.class_data)
+                st.session_state.teacher_data = new_teacher_data
+                st.session_state.total_counts = new_total_counts
+
+                ok, msg = github_save_data(build_save_payload())
+                if ok:
+                    st.success(f"✅ {target_c} 的課表已更新，並已同步至雲端。")
+                else:
+                    st.warning(f"✅ {target_c} 的課表已更新，但雲端同步失敗：{msg}")
+                st.rerun()
 
     with tab2:
         teachers = st.session_state.ordered_teachers
@@ -977,15 +1102,17 @@ if "class_data" in st.session_state:
             st.info("請輸入關鍵字開始搜尋。")
 
     with tab5:
-        st.header("📊 節數檢查")
-        st.caption("設定每個班級、每個科目「一週應該排幾節課」，系統會自動跟目前匯入的課表比對，抓出排多或排少的地方。")
+        st.header("📊 節數檢查與排課衝突偵測")
+        st.caption("設定每個班級、每個科目「一週應該排幾節課」，系統會自動跟目前匯入的課表比對；下方也會列出教師被重複排課的衝突節次。")
 
-        combos = sorted(collect_class_subject_combos(st.session_state.class_data))
+        # 從 df_assign 重新解析出 assign_dict，確保節數檢查涵蓋「配課表有配、但課表完全沒排到」的科目
+        _al, assign_dict_for_check, _tu, _at, _w = parse_assignment(st.session_state.df_assign)
+        combos = sorted(collect_class_subject_combos(st.session_state.class_data, assign_dict_for_check))
         if "expected_hours" not in st.session_state:
             st.session_state.expected_hours = {}
 
         if not combos:
-            st.info("目前課表中沒有解析出任何科目，無法進行節數檢查。")
+            st.info("目前沒有解析出任何科目，無法進行節數檢查。")
         else:
             st.subheader("① 設定應排節數")
             setting_rows = [
@@ -1034,6 +1161,8 @@ if "class_data" in st.session_state:
                     status = "✅ 相符"
                 elif diff > 0:
                     status = f"⚠️ 多排 {diff} 節"
+                elif actual == 0:
+                    status = f"❌ 完全沒排課（配課表有配 {expected} 節）"
                 else:
                     status = f"❌ 少排 {abs(diff)} 節"
                 check_rows.append({
@@ -1054,6 +1183,26 @@ if "class_data" in st.session_state:
                 display_df.sort_values(["班級", "科目"]).reset_index(drop=True),
                 use_container_width=True, hide_index=True,
             )
+
+        st.divider()
+        st.subheader("③ 排課衝突偵測")
+        st.caption("找出同一位教師在同一時段被排到多個不同班級的情況（通常是排課時的人為疏失）。")
+
+        conflicts = detect_teacher_conflicts(st.session_state.class_data)
+        if not conflicts:
+            st.success("🎉 目前沒有偵測到任何排課衝突！")
+        else:
+            st.error(f"🚨 共偵測到 {len(conflicts)} 筆排課衝突")
+            conflict_rows = [
+                {
+                    "教師": cf["teacher"],
+                    "星期": f"週{cf['day']}",
+                    "節次": f"第{cf['period']}節",
+                    "同時被排到的班級": "、".join(cf["classes"]),
+                }
+                for cf in conflicts
+            ]
+            st.dataframe(pd.DataFrame(conflict_rows), use_container_width=True, hide_index=True)
 
 else:
     st.info("👋 請上傳資料檔並點擊執行整合。")
