@@ -219,6 +219,19 @@ def doc_to_bytes(doc):
 # ============================================================
 # 資料解析
 # ============================================================
+_PANDAS_DEDUP_SUFFIX_PATTERN = re.compile(r"\.\d+$")
+
+
+def _strip_pandas_dedup_suffix(name: str) -> str:
+    """
+    Excel 裡如果有兩個欄位剛好同名（例如班級ID欄跟某個科目欄剛好都叫「班級」），
+    pandas 讀取時會自動把後面重複出現的欄位改名成「班級.1」「班級.2」來避免衝突。
+    這裡把這個自動加上去的尾碼還原掉，這樣科目名稱才能跟課表正確比對，
+    不會因為欄位剛好跟保留欄名（班級／導師）撞名，就找不到對應教師。
+    """
+    return _PANDAS_DEDUP_SUFFIX_PATTERN.sub("", str(name))
+
+
 def parse_assignment(df_assign):
     """
     解析配課表，支援兩種格式：
@@ -279,7 +292,8 @@ def parse_assignment(df_assign):
                              var_name="科目", value_name="教師")
         for _, row in df_melted.iterrows():
             c = str(row["班級"]).strip()
-            s = str(row["科目"]).strip()
+            # 還原可能被 pandas 自動加上的重複欄位尾碼（見 _strip_pandas_dedup_suffix 說明）
+            s = _strip_pandas_dedup_suffix(str(row["科目"]).strip())
             t_raw = str(row["教師"]).strip() if pd.notna(row["教師"]) else ""
             register(c, s, t_raw)
 
