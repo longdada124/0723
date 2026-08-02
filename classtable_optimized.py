@@ -185,8 +185,9 @@ def apply_replacements(doc_obj, replacements: dict, color_map: dict = None):
             if matched_color and p.runs:
                 try:
                     p.runs[0].font.color.rgb = RGBColor.from_string(matched_color)
+                    p.runs[0].font.bold = True
                 except ValueError:
-                    pass  # 色碼格式不正確時直接忽略上色，不影響文字本身的取代結果
+                    pass  # 色碼格式不正確時直接忽略上色/加粗，不影響文字本身的取代結果
 
 
 def build_class_replacements(cname, class_data, tutors_map):
@@ -807,7 +808,10 @@ with st.sidebar:
             if "class_data" in st.session_state:
                 if st.button("🔄 手動重新同步到雲端"):
                     ok, msg = github_save_data(build_save_payload())
-                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
         elif not _REQUESTS_AVAILABLE:
             st.caption(
                 "⚠️ 找不到 requests 套件，雲端存檔功能已停用。"
@@ -1154,42 +1158,51 @@ if "class_data" in st.session_state:
 
             if st.button("💾 儲存兼課類型設定"):
                 ok, msg = github_save_data(build_save_payload())
-                st.success(f"☁️ {msg}") if ok else st.warning(msg)
+                if ok:
+                    st.success(f"☁️ {msg}")
+                else:
+                    st.warning(msg)
 
         with st.expander(f"🖊️ 設定 {target_t} 的兼課標記", expanded=False):
             if not st.session_state.duty_types:
                 st.info("請先在上方「⚙️ 管理兼課種類與顏色」新增至少一種兼課類型。")
             else:
-                duty_options = ["（無）"] + list(st.session_state.duty_types.keys())
-                mark_rows = []
-                for p in PERIODS:
-                    row = {"節次": f"第{p}節"}
-                    for d in DAYS:
+                actual_periods = sorted(st.session_state.teacher_data.get(target_t, {}).keys())
+                if not actual_periods:
+                    st.info(f"{target_t} 目前沒有排課，沒有可以標記的節次。")
+                else:
+                    st.caption("只會列出這位教師實際有排課的節次，沒有課的節次不會出現，避免誤標。")
+                    duty_options = ["（無）"] + list(st.session_state.duty_types.keys())
+                    mark_rows = []
+                    for (d, p) in actual_periods:
+                        info = st.session_state.teacher_data[target_t][(d, p)]
                         cur = teacher_marks.get((d, p), "（無）")
-                        row[f"週{d}"] = cur if cur in duty_options else "（無）"
-                    mark_rows.append(row)
-                mark_df = pd.DataFrame(mark_rows)
+                        mark_rows.append({
+                            "星期": f"週{d}", "節次": f"第{p}節",
+                            "班級": info.get("class", ""), "科目": info.get("subj", ""),
+                            "兼課類型": cur if cur in duty_options else "（無）",
+                        })
+                    mark_df = pd.DataFrame(mark_rows)
 
-                col_config = {f"週{d}": st.column_config.SelectboxColumn(options=duty_options) for d in DAYS}
-                edited_mark_df = st.data_editor(
-                    mark_df, use_container_width=True, hide_index=True,
-                    key=f"duty_marks_editor_{target_t}", disabled=["節次"], column_config=col_config,
-                )
+                    edited_mark_df = st.data_editor(
+                        mark_df, use_container_width=True, hide_index=True,
+                        key=f"duty_marks_editor_{target_t}",
+                        disabled=["星期", "節次", "班級", "科目"],
+                        column_config={"兼課類型": st.column_config.SelectboxColumn(options=duty_options)},
+                    )
 
-                if st.button(f"💾 儲存 {target_t} 的兼課標記", key=f"save_duty_marks_{target_t}"):
-                    new_marks = {}
-                    for idx, p in enumerate(PERIODS):
-                        for d in DAYS:
-                            val = edited_mark_df.iloc[idx][f"週{d}"]
+                    if st.button(f"💾 儲存 {target_t} 的兼課標記", key=f"save_duty_marks_{target_t}"):
+                        new_marks = {}
+                        for (d, p), val in zip(actual_periods, edited_mark_df["兼課類型"]):
                             if val and val != "（無）":
                                 new_marks[(d, p)] = val
-                    st.session_state.duty_marks[target_t] = new_marks
-                    ok, msg = github_save_data(build_save_payload())
-                    if ok:
-                        st.success(f"✅ {target_t} 的兼課標記已更新，並已同步至雲端。")
-                    else:
-                        st.warning(f"✅ {target_t} 的兼課標記已更新，但雲端同步失敗：{msg}")
-                    st.rerun()
+                        st.session_state.duty_marks[target_t] = new_marks
+                        ok, msg = github_save_data(build_save_payload())
+                        if ok:
+                            st.success(f"✅ {target_t} 的兼課標記已更新，並已同步至雲端。")
+                        else:
+                            st.warning(f"✅ {target_t} 的兼課標記已更新，但雲端同步失敗：{msg}")
+                        st.rerun()
 
     with tab3:
         st.header("📋 全校配課資料總覽")
@@ -1294,7 +1307,10 @@ if "class_data" in st.session_state:
 
             if st.button("💾 儲存節數設定"):
                 ok, msg = github_save_data(build_save_payload())
-                st.success(f"☁️ {msg}") if ok else st.warning(msg)
+                if ok:
+                    st.success(f"☁️ {msg}")
+                else:
+                    st.warning(msg)
 
             st.divider()
             st.subheader("② 比對結果")
