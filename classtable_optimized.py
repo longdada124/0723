@@ -239,9 +239,62 @@ def build_teacher_color_map(tname, duty_marks, duty_types):
     return color_map
 
 
-def generate_document(template_bytes, replacements, color_map=None):
+def get_teacher_duty_names(tname, duty_marks, duty_types):
+    """
+    取得某位教師目前有標記到的兼課類型（自動去除重複），
+    依照「⚙️ 管理兼課種類與顏色」裡設定的順序排列，順序才會穩定一致。
+    """
+    used = set(duty_marks.get(tname, {}).values())
+    return [name for name in duty_types.keys() if name in used]
+
+
+DUTY_NOTES_PLACEHOLDER = "{{DUTY_NOTES}}"
+
+
+def apply_duty_notes(doc_obj, duty_names, duty_types, placeholder=DUTY_NOTES_PLACEHOLDER):
+    """
+    在文件中找到 {{DUTY_NOTES}} 佔位符所在的段落，換成「■ 兼課類型」的多色註記文字，
+    每種兼課類型各自套用其設定的顏色並加粗（跟課表格子上的標記顏色一致）。
+    佔位符前後若有其他文字（例如「備註：{{DUTY_NOTES}}」），會保留原本文字，只替換佔位符本身。
+    若這位教師沒有任何兼課標記，佔位符會被替換成空白。
+    """
+    targets = list(doc_obj.paragraphs)
+    for table in doc_obj.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                targets.extend(cell.paragraphs)
+
+    for p in targets:
+        full_text = "".join(run.text for run in p.runs)
+        if placeholder not in full_text:
+            continue
+        prefix, _, suffix = full_text.partition(placeholder)
+
+        for run in list(p.runs):
+            run._element.getparent().remove(run._element)
+
+        if prefix:
+            p.add_run(prefix)
+        for i, duty_name in enumerate(duty_names):
+            if i > 0:
+                p.add_run("　")
+            color_hex = str(duty_types.get(duty_name, "")).lstrip("#")
+            run = p.add_run(f"■ {duty_name}")
+            if color_hex:
+                try:
+                    run.font.color.rgb = RGBColor.from_string(color_hex)
+                    run.font.bold = True
+                except ValueError:
+                    pass
+        if suffix:
+            p.add_run(suffix)
+
+
+def generate_document(template_bytes, replacements, color_map=None, duty_names=None, duty_types=None):
     doc = Document(BytesIO(template_bytes))
     apply_replacements(doc, replacements, color_map=color_map)
+    if duty_names is not None:
+        apply_duty_notes(doc, duty_names, duty_types or {})
     return doc
 
 
@@ -1109,7 +1162,11 @@ if "class_data" in st.session_state:
                     target_t, st.session_state.teacher_data, st.session_state.base_hours, st.session_state.total_counts
                 )
                 color_map = build_teacher_color_map(target_t, st.session_state.duty_marks, duty_types_cfg)
-                doc = generate_document(st.session_state.teacher_template, repl, color_map=color_map)
+                duty_names = get_teacher_duty_names(target_t, st.session_state.duty_marks, duty_types_cfg)
+                doc = generate_document(
+                    st.session_state.teacher_template, repl,
+                    color_map=color_map, duty_names=duty_names, duty_types=duty_types_cfg,
+                )
                 st.download_button(f"💾 儲存 {target_t} 課表", doc_to_bytes(doc), f"{target_t}_教師課表.docx")
         with bt2:
             sel_t_batch = st.multiselect("批次合併教師", teachers, default=teachers)
@@ -1121,7 +1178,11 @@ if "class_data" in st.session_state:
                             tname, st.session_state.teacher_data, st.session_state.base_hours, st.session_state.total_counts
                         )
                         color_map = build_teacher_color_map(tname, st.session_state.duty_marks, duty_types_cfg)
-                        tmp = generate_document(st.session_state.teacher_template, repl, color_map=color_map)
+                        duty_names = get_teacher_duty_names(tname, st.session_state.duty_marks, duty_types_cfg)
+                        tmp = generate_document(
+                            st.session_state.teacher_template, repl,
+                            color_map=color_map, duty_names=duty_names, duty_types=duty_types_cfg,
+                        )
                         if i == 0:
                             main_doc = tmp
                         else:
