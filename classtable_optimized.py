@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from docx import Document
+from docx.shared import RGBColor
 from io import BytesIO
 import re
 import os
@@ -139,7 +140,7 @@ def load_default_template(file_name):
     return None
 
 
-def apply_replacements(doc_obj, replacements: dict):
+def apply_replacements(doc_obj, replacements: dict, color_map: dict = None):
     """
     一次套用一整組佔位符取代，取代舊版「每個佔位符各自呼叫一次、
     每次都重新掃描整份文件」的做法。
@@ -149,6 +150,9 @@ def apply_replacements(doc_obj, replacements: dict):
       2. 對每個段落先做一次「{{」快速排除，沒有佔位符的段落直接跳過，
          不必逐一比對 80 幾個佔位符字串。
       3. 對合併大量班級／教師課表的批次匯出來說，效果最明顯。
+
+    color_map（選填）：{佔位符: 6碼色碼（不含#）}，若該段落含有對應的佔位符，
+    取代完文字後會把整段文字設成指定顏色，用於兼課類型的顏色標記。
     """
     targets = list(doc_obj.paragraphs)
     for table in doc_obj.tables:
@@ -156,6 +160,7 @@ def apply_replacements(doc_obj, replacements: dict):
             for cell in row.cells:
                 targets.extend(cell.paragraphs)
 
+    color_map = color_map or {}
     formatted = {}
     for old_text, new_text in replacements.items():
         if isinstance(new_text, (float, int)):
@@ -168,12 +173,20 @@ def apply_replacements(doc_obj, replacements: dict):
         if "{{" not in full_text:
             continue
         updated_text = full_text
+        matched_color = None
         for old_text, new_val in formatted.items():
             if old_text in updated_text:
                 updated_text = updated_text.replace(old_text, new_val)
+                if old_text in color_map:
+                    matched_color = color_map[old_text]
         if updated_text != full_text:
             for i, run in enumerate(p.runs):
                 run.text = updated_text if i == 0 else ""
+            if matched_color and p.runs:
+                try:
+                    p.runs[0].font.color.rgb = RGBColor.from_string(matched_color)
+                except ValueError:
+                    pass  # 色碼格式不正確時直接忽略上色，不影響文字本身的取代結果
 
 
 def build_class_replacements(cname, class_data, tutors_map):
@@ -208,9 +221,26 @@ def build_teacher_replacements(tname, teacher_data, base_hours, total_counts):
     return repl
 
 
-def generate_document(template_bytes, replacements):
+def build_teacher_color_map(tname, duty_marks, duty_types):
+    """
+    依照兼課標記，組出教師課表匯出 Word 時每個節次需要上色的佔位符對照表。
+    同時上色 CD（班級）與 SD（科目）兩個佔位符，確保不管樣板怎麼排版，
+    整格內容都會套用兼課類型對應的顏色。
+    """
+    marks = duty_marks.get(tname, {})
+    color_map = {}
+    for (d, p), duty_name in marks.items():
+        color = duty_types.get(duty_name)
+        if color:
+            hex_color = str(color).lstrip("#")
+            color_map[f"{{{{CD{d}P{p}}}}}"] = hex_color
+            color_map[f"{{{{SD{d}P{p}}}}}"] = hex_color
+    return color_map
+
+
+def generate_document(template_bytes, replacements, color_map=None):
     doc = Document(BytesIO(template_bytes))
-    apply_replacements(doc, replacements)
+    apply_replacements(doc, replacements, color_map=color_map)
     return doc
 
 
@@ -624,6 +654,8 @@ def build_save_payload():
         "df_assign": st.session_state.df_assign.to_dict(orient="records"),
         "import_warnings": st.session_state.get("import_warnings", []),
         "expected_hours": st.session_state.get("expected_hours", {}),
+        "duty_types": st.session_state.get("duty_types", {}),
+        "duty_marks": serialize_period_dict(st.session_state.get("duty_marks", {})),
     }
 
 
@@ -644,6 +676,8 @@ def restore_from_payload(payload: dict):
         "df_assign": df_assign,
         "import_warnings": payload.get("import_warnings", []),
         "expected_hours": payload.get("expected_hours", {}),
+        "duty_types": payload.get("duty_types", {}),
+        "duty_marks": deserialize_period_dict(payload.get("duty_marks", {})),
         "sel_class": sorted(class_data.keys())[0] if class_data else None,
         "sel_teacher": ordered_teachers[0] if ordered_teachers else None,
         "class_template": load_default_template(TEMPLATE_FILES["class"]),
@@ -1024,6 +1058,11 @@ if "class_data" in st.session_state:
         m2.metric("教學總時數", f"{total} 節")
         m3.metric("兼代課時數", f"{total - base} 節")
 
+        st.session_state.setdefault("duty_types", {})
+        st.session_state.setdefault("duty_marks", {})
+        duty_types_cfg = st.session_state.duty_types
+        teacher_marks = st.session_state.duty_marks.get(target_t, {})
+
         t_prev = [
             {
                 "節次": f"第 {p} 節",
@@ -1035,7 +1074,29 @@ if "class_data" in st.session_state:
             }
             for p in PERIODS
         ]
-        st.table(pd.DataFrame(t_prev))
+        t_prev_df = pd.DataFrame(t_prev)
+
+        if teacher_marks and duty_types_cfg:
+            def _highlight_duty_cells(_df):
+                styles = pd.DataFrame("", index=_df.index, columns=_df.columns)
+                for idx, p in enumerate(PERIODS):
+                    for d in DAYS:
+                        duty_name = teacher_marks.get((d, p))
+                        color = duty_types_cfg.get(duty_name) if duty_name else None
+                        if color:
+                            styles.iloc[idx, styles.columns.get_loc(f"週{d}")] = f"color: #{color}; font-weight: bold;"
+                return styles
+
+            st.dataframe(t_prev_df.style.apply(_highlight_duty_cells, axis=None), use_container_width=True, hide_index=True)
+            legend_html = " ｜ ".join(
+                f'<span style="color:#{color}; font-weight:bold;">■ {name}</span>'
+                for name, color in duty_types_cfg.items()
+                if any(teacher_marks.get((d, p)) == name for d in DAYS for p in PERIODS)
+            )
+            if legend_html:
+                st.markdown(f"**圖例**：{legend_html}", unsafe_allow_html=True)
+        else:
+            st.table(t_prev_df)
 
         bt1, bt2 = st.columns(2)
         with bt1:
@@ -1043,7 +1104,8 @@ if "class_data" in st.session_state:
                 repl = build_teacher_replacements(
                     target_t, st.session_state.teacher_data, st.session_state.base_hours, st.session_state.total_counts
                 )
-                doc = generate_document(st.session_state.teacher_template, repl)
+                color_map = build_teacher_color_map(target_t, st.session_state.duty_marks, duty_types_cfg)
+                doc = generate_document(st.session_state.teacher_template, repl, color_map=color_map)
                 st.download_button(f"💾 儲存 {target_t} 課表", doc_to_bytes(doc), f"{target_t}_教師課表.docx")
         with bt2:
             sel_t_batch = st.multiselect("批次合併教師", teachers, default=teachers)
@@ -1054,7 +1116,8 @@ if "class_data" in st.session_state:
                         repl = build_teacher_replacements(
                             tname, st.session_state.teacher_data, st.session_state.base_hours, st.session_state.total_counts
                         )
-                        tmp = generate_document(st.session_state.teacher_template, repl)
+                        color_map = build_teacher_color_map(tname, st.session_state.duty_marks, duty_types_cfg)
+                        tmp = generate_document(st.session_state.teacher_template, repl, color_map=color_map)
                         if i == 0:
                             main_doc = tmp
                         else:
@@ -1062,6 +1125,71 @@ if "class_data" in st.session_state:
                                 main_doc.element.body.append(el)
                 if main_doc:
                     st.download_button("💾 下載教師彙整檔", doc_to_bytes(main_doc), "全校教師課表_彙整.docx")
+
+        with st.expander("⚙️ 管理兼課種類與顏色", expanded=False):
+            st.caption(
+                "新增／刪除兼課類型，並設定該類型在課表上要顯示的文字顏色（請輸入6碼色碼，不用加#）。"
+                "常見色碼參考：紅色 FF0000／藍色 0000FF／綠色 008000／橘色 FFA500／紫色 800080。"
+            )
+            dt_rows = [{"類型名稱": k, "顏色色碼": v} for k, v in st.session_state.duty_types.items()]
+            dt_df = pd.DataFrame(dt_rows) if dt_rows else pd.DataFrame(columns=["類型名稱", "顏色色碼"])
+            edited_dt_df = st.data_editor(
+                dt_df, num_rows="dynamic", use_container_width=True, hide_index=True, key="duty_types_editor",
+            )
+
+            new_duty_types = {}
+            invalid_names = []
+            for _, row in edited_dt_df.iterrows():
+                name = str(row.get("類型名稱", "") or "").strip()
+                color_raw = str(row.get("顏色色碼", "") or "").strip().lstrip("#").upper()
+                if not name:
+                    continue
+                if re.fullmatch(r"[0-9A-F]{6}", color_raw):
+                    new_duty_types[name] = color_raw
+                else:
+                    invalid_names.append(name)
+            st.session_state.duty_types = new_duty_types
+            if invalid_names:
+                st.warning(f"⚠️ 以下類型的顏色色碼格式不正確，已略過：{'、'.join(invalid_names)}（請輸入6碼色碼，例如 FF0000）")
+
+            if st.button("💾 儲存兼課類型設定"):
+                ok, msg = github_save_data(build_save_payload())
+                st.success(f"☁️ {msg}") if ok else st.warning(msg)
+
+        with st.expander(f"🖊️ 設定 {target_t} 的兼課標記", expanded=False):
+            if not st.session_state.duty_types:
+                st.info("請先在上方「⚙️ 管理兼課種類與顏色」新增至少一種兼課類型。")
+            else:
+                duty_options = ["（無）"] + list(st.session_state.duty_types.keys())
+                mark_rows = []
+                for p in PERIODS:
+                    row = {"節次": f"第{p}節"}
+                    for d in DAYS:
+                        cur = teacher_marks.get((d, p), "（無）")
+                        row[f"週{d}"] = cur if cur in duty_options else "（無）"
+                    mark_rows.append(row)
+                mark_df = pd.DataFrame(mark_rows)
+
+                col_config = {f"週{d}": st.column_config.SelectboxColumn(options=duty_options) for d in DAYS}
+                edited_mark_df = st.data_editor(
+                    mark_df, use_container_width=True, hide_index=True,
+                    key=f"duty_marks_editor_{target_t}", disabled=["節次"], column_config=col_config,
+                )
+
+                if st.button(f"💾 儲存 {target_t} 的兼課標記", key=f"save_duty_marks_{target_t}"):
+                    new_marks = {}
+                    for idx, p in enumerate(PERIODS):
+                        for d in DAYS:
+                            val = edited_mark_df.iloc[idx][f"週{d}"]
+                            if val and val != "（無）":
+                                new_marks[(d, p)] = val
+                    st.session_state.duty_marks[target_t] = new_marks
+                    ok, msg = github_save_data(build_save_payload())
+                    if ok:
+                        st.success(f"✅ {target_t} 的兼課標記已更新，並已同步至雲端。")
+                    else:
+                        st.warning(f"✅ {target_t} 的兼課標記已更新，但雲端同步失敗：{msg}")
+                    st.rerun()
 
     with tab3:
         st.header("📋 全校配課資料總覽")
